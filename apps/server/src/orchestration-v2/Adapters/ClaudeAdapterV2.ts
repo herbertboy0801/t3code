@@ -1779,6 +1779,7 @@ export function makeClaudeQueryOptions(input: {
   readonly supportedDialogKinds?: ClaudeQueryOptions["supportedDialogKinds"];
   readonly allowDangerouslySkipPermissions?: boolean;
   readonly appendSystemPromptFileText?: string;
+  readonly worktreeMemoryText?: string;
   // Flag settings, because a user's settings.json env beats the process env in Claude Code.
   readonly toolSearchOverride?: "true";
 }): ClaudeAgentSdkQueryOptions {
@@ -1798,6 +1799,7 @@ export function makeClaudeQueryOptions(input: {
   // appendSystemPrompt, so launch-argument text has to travel in that value.
   // The CLI puts file text before inline text and trims one trailing newline.
   const launchAppendSystemPrompt = [
+    input.worktreeMemoryText,
     input.appendSystemPromptFileText?.replace(/\r?\n$/, ""),
     launchArgAppendSystemPrompt,
   ].filter((text): text is string => typeof text === "string" && text.length > 0);
@@ -1952,6 +1954,84 @@ const readClaudeAppendSystemPromptFile = Effect.fnUntraced(function* (input: {
       Effect.mapError((cause) => new ClaudeAppendSystemPromptFileError({ path: filePath, cause })),
     );
 });
+
+// A worktree's .git file points at <main>/.git/worktrees/<name>, whose commondir leads back to
+// <main>/.git. A bare repository has no main checkout, so its worktree keeps its own file.
+const claudeMainCheckoutRoot = (
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+  checkout: string,
+) =>
+  fileSystem.readFileString(path.join(checkout, ".git")).pipe(
+    Effect.flatMap((pointer) => {
+      const gitDir = /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim();
+      if (gitDir === undefined) return Effect.succeed(checkout);
+      const worktreeGitDir = path.resolve(checkout, gitDir);
+      return fileSystem.readFileString(path.join(worktreeGitDir, "commondir")).pipe(
+        Effect.map((commonDir) => {
+          const common = path.resolve(worktreeGitDir, commonDir.trim());
+          return path.basename(common) === ".git" ? path.dirname(common) : checkout;
+        }),
+      );
+    }),
+    Effect.orElseSucceed(() => checkout),
+  );
+
+/**
+ * Claude Code loads CLAUDE.md and CLAUDE.local.md from the cwd's ancestors. A T3 worktree lives
+ * outside its repository, so the main checkout's files and its own ancestors' are never found.
+ * Their text is appended rather than added as directories, which would widen file access; @imports
+ * inside them stay unexpanded.
+ */
+const readClaudeWorktreeMemoryText = Effect.fn("ClaudeAdapterV2.readWorktreeMemoryText")(
+  function* (input: {
+    readonly cwd: string | null;
+    readonly fileSystem: FileSystem.FileSystem;
+    readonly path: Path.Path;
+  }) {
+    const { fileSystem, path } = input;
+    if (input.cwd === null) return undefined;
+    const exists = (file: string) =>
+      fileSystem.exists(file).pipe(Effect.orElseSucceed(() => false));
+    let checkout = path.resolve(input.cwd);
+    while (!(yield* exists(path.join(checkout, ".git")))) {
+      if (path.dirname(checkout) === checkout) return undefined;
+      checkout = path.dirname(checkout);
+    }
+    const main = yield* claudeMainCheckoutRoot(fileSystem, path, checkout);
+    if (main === checkout) return undefined;
+
+    const containsCheckout = (directory: string) => {
+      const relative = path.relative(directory, checkout);
+      return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    };
+    const candidates: Array<string> = [];
+    for (let directory = main; ; directory = path.dirname(directory)) {
+      if (!containsCheckout(directory)) {
+        const names =
+          directory !== main
+            ? ["CLAUDE.md", "CLAUDE.local.md"]
+            : (yield* exists(path.join(checkout, "CLAUDE.md")))
+              ? ["CLAUDE.local.md"]
+              : ["CLAUDE.md", "CLAUDE.local.md"];
+        candidates.unshift(...names.map((name) => path.join(directory, name)));
+      }
+      if (path.dirname(directory) === directory) break;
+    }
+
+    const sections: Array<string> = [];
+    for (const file of candidates) {
+      const text = yield* fileSystem.readFileString(file).pipe(Effect.orElseSucceed(() => ""));
+      if (text.trim().length > 0) sections.push(`Contents of ${file}:\n\n${text.trimEnd()}`);
+    }
+    if (sections.length === 0) return undefined;
+    return [
+      "This session runs in a worktree of the repository at " +
+        `${main}. These memory files from that checkout and its parent directories apply here too:`,
+      ...sections,
+    ].join("\n\n");
+  },
+);
 
 const decodeClaudeLaunchArgSettings = Schema.decodeUnknownEffect(
   fromLenientJson(Schema.Record(Schema.String, Schema.Unknown)),
@@ -4997,23 +5077,6 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
       }),
       Effect.orElseSucceed(() => undefined),
     );
-  // A worktree's .git file points at <main>/.git/worktrees/<name>, whose commondir leads back to
-  // <main>/.git. A bare repository has no main checkout, so its worktree keeps its own file.
-  const mainCheckoutRoot = (checkout: string) =>
-    fileSystem.readFileString(path.join(checkout, ".git")).pipe(
-      Effect.flatMap((pointer) => {
-        const gitDir = /^gitdir:\s*(.+)$/m.exec(pointer)?.[1]?.trim();
-        if (gitDir === undefined) return Effect.succeed(checkout);
-        const worktreeGitDir = path.resolve(checkout, gitDir);
-        return fileSystem.readFileString(path.join(worktreeGitDir, "commondir")).pipe(
-          Effect.map((commonDir) => {
-            const common = path.resolve(worktreeGitDir, commonDir.trim());
-            return path.basename(common) === ".git" ? path.dirname(common) : checkout;
-          }),
-        );
-      }),
-      Effect.orElseSucceed(() => checkout),
-    );
   // Claude Code keeps .claude/settings.local.json at the repository root, or in cwd outside a
   // repository, on Windows, or when the root is home. Its owner check is skipped: missing it only
   // leaves tool search on, Claude Code's default.
@@ -5026,7 +5089,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
         .exists(path.join(directory, ".git"))
         .pipe(Effect.orElseSucceed(() => false));
       if (isCheckout) {
-        const root = yield* mainCheckoutRoot(directory);
+        const root = yield* claudeMainCheckoutRoot(fileSystem, path, directory);
         return root === (yield* HostProcess.HomeDirectory) ? cwd : root;
       }
       if (path.dirname(directory) === directory) return cwd;
@@ -11014,6 +11077,11 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             fileSystem,
             path,
           });
+          const worktreeMemoryText = yield* readClaudeWorktreeMemoryText({
+            cwd: turnInput.runtimePolicy.cwd,
+            fileSystem,
+            path,
+          });
           const closedExistingNativeThreadId = existing !== null ? existing.nativeThreadId : null;
           if (existing !== null) {
             yield* existing.query.close.pipe(Effect.ignore);
@@ -11077,6 +11145,7 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
             onElicitation,
             supportedDialogKinds: ["resume_return"],
             ...(appendSystemPromptFileText === undefined ? {} : { appendSystemPromptFileText }),
+            ...(worktreeMemoryText === undefined ? {} : { worktreeMemoryText }),
             ...(toolSearchOverride === undefined ? {} : { toolSearchOverride }),
           });
           const resolvedTurnCwd = yield* fileSystem

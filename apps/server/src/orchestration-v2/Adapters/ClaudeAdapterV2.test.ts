@@ -1156,6 +1156,70 @@ describe("ClaudeAdapterV2 append-system-prompt-file launch argument", () => {
     ),
   );
 
+  // regression: #27656 a worktree outside its repository skipped the main checkout's memory files
+  it.effect("appends the main checkout's memory files to a worktree session", () =>
+    Effect.scoped(
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const base = yield* fileSystem.makeTempDirectoryScoped({ prefix: "t3-claude-memory-" });
+        const parent = NodePath.join(base, "work");
+        const main = NodePath.join(parent, "app");
+        const worktreeGitDir = NodePath.join(main, ".git", "worktrees", "wt");
+        const worktree = NodePath.join(base, "worktrees", "app-wt");
+        yield* fileSystem.makeDirectory(worktreeGitDir, { recursive: true });
+        yield* fileSystem.makeDirectory(worktree, { recursive: true });
+        yield* fileSystem.writeFileString(NodePath.join(worktreeGitDir, "commondir"), "../..\n");
+        yield* fileSystem.writeFileString(
+          NodePath.join(worktree, ".git"),
+          `gitdir: ${worktreeGitDir}\n`,
+        );
+        const files = [
+          [base, "CLAUDE.md", "Shared ancestor sentinel"],
+          [parent, "CLAUDE.md", "Parent shared sentinel"],
+          [parent, "CLAUDE.local.md", "Parent local sentinel"],
+          [main, "CLAUDE.md", "Main shared sentinel"],
+          [main, "CLAUDE.local.md", "Main local sentinel"],
+          [worktree, "CLAUDE.md", "Worktree shared sentinel"],
+        ] as const;
+        for (const [directory, name, text] of files) {
+          yield* fileSystem.writeFileString(NodePath.join(directory, name), `${text}\n`);
+        }
+
+        const fromMain = appendSystemPrompt((yield* startTurnWithLaunchArgs("", main)).opened[0]);
+        const { exit, opened } = yield* startTurnWithLaunchArgs("", worktree);
+        assert.isTrue(Exit.isSuccess(exit));
+        const append = appendSystemPrompt(opened[0]) ?? "";
+        assert.notInclude(fromMain ?? "", "sentinel");
+        const loaded = [
+          "Parent shared sentinel",
+          "Parent local sentinel",
+          "Main local sentinel",
+        ].map((text) => append.indexOf(text));
+        assert.isTrue(
+          loaded.every((index) => index >= 0),
+          append,
+        );
+        assert.deepEqual(
+          loaded,
+          [...loaded].sort((a, b) => a - b),
+        );
+        // Claude Code loads these itself: shared ancestors of the worktree and its tracked files.
+        assert.notInclude(append, "Shared ancestor sentinel");
+        assert.notInclude(append, "Worktree shared sentinel");
+        assert.notInclude(append, "Main shared sentinel");
+      }).pipe(
+        Effect.provide(
+          Layer.mergeAll(
+            IdAllocator.layer,
+            McpProviderSessions.layer,
+            NodeServices.layer,
+            NodeCrypto.layer,
+          ),
+        ),
+      ),
+    ),
+  );
+
   // regression: #15073 the SDK replaced the --settings launch argument with T3's settings
   it.effect.each([
     `--settings '{"skillOverrides":{"lint":"off"},"showThinkingSummaries":false}'`,
